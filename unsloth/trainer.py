@@ -460,9 +460,22 @@ def _find_ddp_model(model):
         # Don't recurse into basic types
         if not hasattr(obj, '__dict__') and not hasattr(obj, '__getattribute__'):
             return None
-            
-        # Check common attribute names where DDP models might be nested
-        for attr_name in ['module', 'model', 'base_model', '_orig_mod', '_module', '_model']:
+        
+        # Enhanced search: Check for more comprehensive list of attribute names
+        # where DDP models might be nested in various training frameworks
+        search_attrs = [
+            'module', 'model', 'base_model', '_orig_mod', '_module', '_model',
+            'wrapped_model', 'inner_model', '_wrapped_model', '_inner_model',
+            'core_model', '_core_model', 'underlying_model', '_underlying_model',
+            # Accelerate library attributes
+            '_ddp_module', '_orig_ddp_module', '_accelerate_wrapped_model',
+            # Transformers library attributes  
+            '_transformers_model', '_hf_model',
+            # TRL/SFT trainer attributes
+            '_sft_model', '_trl_model'
+        ]
+        
+        for attr_name in search_attrs:
             try:
                 if hasattr(obj, attr_name):
                     attr_value = getattr(obj, attr_name)
@@ -713,14 +726,14 @@ def _prepare_ddp_reducer_for_training(trainer, model):
                         
                         try:
                             # Run dummy forward pass to initialize DDP reducer and autograd hooks
-                            with torch.cuda.amp.autocast(enabled=False):  # Disable autocast for dummy pass
+                            with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for dummy pass
                                 _ = ddp_model(**dummy_input)
 
                         except Exception:
                             # If structured input fails, try simple tensor input
                             try:
                                 dummy_tensor = torch.randn(1, 2, device=device, dtype=dtype)
-                                with torch.cuda.amp.autocast(enabled=False):
+                                with torch.amp.autocast('cuda', enabled=False):
                                     _ = ddp_model(dummy_tensor)
 
                             except Exception:

@@ -99,9 +99,22 @@ DEVICE_COUNT : int = get_device_count()
 # Reduce VRAM usage by reducing fragmentation
 # And optimize pinning of memory
 if DEVICE_TYPE == "cuda" and os.environ.get("UNSLOTH_VLLM_STANDBY", "0")=="0":
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = \
-        "expandable_segments:True,"\
-        "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
+    # Enhanced memory allocation configuration for multi-GPU and MoE models
+    memory_config = "expandable_segments:True,"
+    
+    # Check if we're in a distributed training environment
+    if (os.environ.get("LOCAL_RANK") is not None or 
+        os.environ.get("WORLD_SIZE") is not None or
+        os.environ.get("RANK") is not None):
+        # For multi-GPU training, use more conservative memory allocation
+        # to reduce fragmentation across GPUs
+        memory_config += "roundup_power2_divisions:[16:512,32:256,64:128,128:64,>:32],"
+        memory_config += "max_split_size_mb:512"
+    else:
+        # For single GPU, use the standard configuration
+        memory_config += "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
+    
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = memory_config
 
 # We support Pytorch 2
 # Fixes https://github.com/unslothai/unsloth/issues/38

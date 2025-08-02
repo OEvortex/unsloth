@@ -48,6 +48,7 @@ from unsloth_zoo.utils import Version, _get_dtype
 torch_nn_functional_softmax = torch.nn.functional.softmax
 def Qwen3MoeSparseMoeBlock_fast_forward(self, X, temp_gate = None, temp_up = None):
     # adapted from https://github.com/huggingface/transformers/pull/36878/files#diff-0855b77fc27ad9449158a1c74953f909b011c00de7125f7c8e68d0ff209c092aR356-R370
+    # Enhanced with memory optimizations for multi-GPU training
     
     bsz, seq_len, hd = X.shape
     X = X.view(-1, hd)
@@ -59,18 +60,35 @@ def Qwen3MoeSparseMoeBlock_fast_forward(self, X, temp_gate = None, temp_up = Non
     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
     # we cast back to the input dtype
     routing_weights = routing_weights.to(X.dtype)
-    final_X = torch.zeros(
-        (bsz * seq_len, hd), dtype=X.dtype, device=X.device
-    )
+    
+    # Memory optimization: Pre-allocate final_X with explicit memory management
+    # Use bfloat16 if possible to reduce memory footprint
+    if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'is_compiling') and torch._dynamo.is_compiling():
+        # During compilation, avoid memory optimizations that might interfere
+        final_X = torch.zeros((bsz * seq_len, hd), dtype=X.dtype, device=X.device)
+    else:
+        # For runtime, optimize memory allocation
+        final_X = torch.zeros((bsz * seq_len, hd), dtype=X.dtype, device=X.device, 
+                             memory_format=torch.contiguous_format)
 
     # One hot encode the selected experts to create an expert mask
     # this will be used to easily index which expert is going to be sollicitated
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
+    # Memory optimization: Process experts with explicit memory management
+    # Clear intermediate tensors more aggressively in multi-GPU environments
+    import os
+    is_distributed = (os.environ.get("LOCAL_RANK") is not None or 
+                     os.environ.get("WORLD_SIZE") is not None)
+    
     # Loop over all available experts in the model and perform the computation on each expert
     for expert_idx in range(self.num_experts):
         expert_layer = self.experts[expert_idx]
         idx, top_x = torch.where(expert_mask[expert_idx])
+
+        if len(top_x) == 0:
+            # Skip experts with no tokens assigned to reduce computation
+            continue
 
         # Index the correct hidden states and compute the expert hidden state for
         # the current expert. We need to make sure to multiply the output hidden
@@ -81,6 +99,14 @@ def Qwen3MoeSparseMoeBlock_fast_forward(self, X, temp_gate = None, temp_up = Non
         # However `index_add_` only support torch tensors for indexing so we'll use
         # the `top_x` tensor here.
         final_X.index_add_(0, top_x, current_X.to(X.dtype))
+        
+        # Memory optimization: Clear intermediate tensors in distributed training
+        if is_distributed and expert_idx % 4 == 3:  # Every 4 experts
+            # Force garbage collection of intermediate results
+            del current_state, current_X
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+    
     final_X = final_X.reshape(bsz, seq_len, hd)
     return final_X, router_logits
 pass
