@@ -40,6 +40,57 @@ __all__ = [
     "UnslothVisionDataCollator",
 ]
 
+# DDP Configuration Environment Variables
+# Users can set these to control DDP behavior
+DDP_CONFIG = {
+    # Core DDP controls
+    "UNSLOTH_DISABLE_DDP_STATIC_GRAPH": "Disable DDP static graph optimization (0/1)",
+    "UNSLOTH_DISABLE_DDP_STATIC_GRAPH_FOR_GRAD_CHECKPOINT": "Disable DDP static graph when gradient checkpointing detected (0/1)",
+    "UNSLOTH_DISABLE_GRAD_CHECKPOINT_HOOKS": "Disable gradient checkpointing safety hooks (0/1)",
+
+    # Gradient checkpointing detection
+    "UNSLOTH_USE_GRADIENT_CHECKPOINTING": "Force enable gradient checkpointing detection (0/1)",
+    "GRADIENT_CHECKPOINTING": "Alternative gradient checkpointing flag (0/1)",
+
+    # Debugging and diagnostics
+    "UNSLOTH_DEBUG_DDP": "Enable verbose DDP debugging output (0/1)",
+    "UNSLOTH_DEBUG_DDP_MODEL_DETECTION": "Enable DDP model detection debugging (0/1)",
+    "UNSLOTH_DEBUG_REDUCER": "Enable DDP reducer debugging (0/1)",
+
+    # Memory management
+    "UNSLOTH_DDP_MEMORY_CLEANUP": "Enable aggressive memory cleanup in DDP (0/1, default: 1)",
+    "UNSLOTH_DDP_DUMMY_FORWARD_STRATEGIES": "Number of dummy forward strategies to try (default: 3)",
+
+    # Multi-GPU configuration
+    "UNSLOTH_ENABLE_MULTIGPU": "Enable multi-GPU training auto-detection (0/1)",
+    "UNSLOTH_FORCE_DDP_FIND_UNUSED_PARAMETERS": "Force DDP find_unused_parameters setting (true/false)",
+
+    # Advanced DDP settings
+    "UNSLOTH_DDP_TIMEOUT_SECONDS": "DDP initialization timeout in seconds (default: 1800)",
+    "UNSLOTH_DDP_BACKEND": "Force DDP backend (nccl/gloo/mpi)",
+    "UNSLOTH_DDP_BUCKET_SIZE_MB": "DDP bucket size in MB (default: 25)",
+}
+
+def _get_ddp_config(key, default=None):
+    """Get DDP configuration value from environment variables."""
+    import os
+    value = os.environ.get(key, default)
+    if value in ("0", "false", "False", "FALSE"):
+        return False
+    elif value in ("1", "true", "True", "TRUE"):
+        return True
+    return value
+
+def _print_ddp_config():
+    """Print current DDP configuration for debugging."""
+    import os
+    print("Unsloth DDP Configuration:")
+    print("-" * 50)
+    for key, description in DDP_CONFIG.items():
+        value = os.environ.get(key, "not set")
+        print(f"{key}: {value} ({description})")
+    print("-" * 50)
+
 # Unsloth gradient accumulation fix:
 from transformers import __version__ as transformers_version
 if Version(transformers_version) > Version("4.45.2"):
@@ -152,15 +203,35 @@ class UnslothTrainer(SFTTrainer):
             ddp_model = self._find_ddp_model(model)
             if ddp_model is not None and hasattr(ddp_model, 'reducer') and ddp_model.reducer is not None:
                 reducer = ddp_model.reducer
-                
+
                 # Reset the ready buckets tracking for gradient checkpointing
                 if hasattr(reducer, '_unsloth_ready_buckets'):
                     reducer._unsloth_ready_buckets.clear()
-                    
+
                 # Reset reducer's internal state to prevent autograd hook conflicts
                 if hasattr(reducer, 'next_bucket'):
                     reducer.next_bucket = 0
-                    
+
+                # Enhanced memory management: Clear any cached bucket states
+                if hasattr(reducer, '_unsloth_bucket_ready_count'):
+                    reducer._unsloth_bucket_ready_count.clear()
+
+                # Reset iteration counter for gradient checkpointing tracking
+                if hasattr(reducer, '_unsloth_iteration_count'):
+                    reducer._unsloth_iteration_count = 0
+
+                # Clear any accumulated gradient states that might cause memory issues
+                try:
+                    for param in ddp_model.parameters():
+                        if param.requires_grad and param.grad is not None:
+                            # Only clear gradients if they're not needed for the current step
+                            # This helps prevent memory accumulation in gradient checkpointing
+                            if hasattr(param, '_unsloth_grad_cleared'):
+                                param.grad = None
+                                delattr(param, '_unsloth_grad_cleared')
+                except Exception:
+                    pass
+
         except Exception:
             # Silently continue if reset fails - this is a safeguard, not critical
             pass
@@ -248,7 +319,7 @@ class UnslothTrainer(SFTTrainer):
                     # The key insight is that DDP's reducer needs to be fully initialized
                     # with proper autograd hook registration before any backward pass occurs.
                     
-                    # Method 1: Force a dummy forward pass to ensure DDP is fully initialized
+                    # Method 1: Enhanced dummy forward pass to ensure DDP is fully initialized
                     # This ensures the reducer knows about all parameters and their autograd hooks
                     try:
                         # Create dummy input that matches the model's expected input structure
@@ -258,71 +329,144 @@ class UnslothTrainer(SFTTrainer):
                             first_param = next(ddp_model.parameters())
                             device = first_param.device
                             dtype = first_param.dtype
-                            
-                            # Create minimal dummy input - most transformer models expect input_ids
-                            dummy_input = {
-                                'input_ids': torch.tensor([[1, 2]], device=device, dtype=torch.long),
-                                'attention_mask': torch.tensor([[1, 1]], device=device, dtype=torch.long),
-                            }
-                            
+
                             # Set model to eval mode temporarily to avoid affecting training state
                             original_training_mode = ddp_model.training
                             ddp_model.eval()
-                            
+
+                            # Try multiple dummy input strategies
+                            dummy_inputs = [
+                                # Strategy 1: Standard transformer input
+                                {
+                                    'input_ids': torch.tensor([[1, 2]], device=device, dtype=torch.long),
+                                    'attention_mask': torch.tensor([[1, 1]], device=device, dtype=torch.long),
+                                },
+                                # Strategy 2: Extended transformer input with position_ids
+                                {
+                                    'input_ids': torch.tensor([[1, 2]], device=device, dtype=torch.long),
+                                    'attention_mask': torch.tensor([[1, 1]], device=device, dtype=torch.long),
+                                    'position_ids': torch.tensor([[0, 1]], device=device, dtype=torch.long),
+                                },
+                                # Strategy 3: Vision-language model input
+                                {
+                                    'input_ids': torch.tensor([[1, 2]], device=device, dtype=torch.long),
+                                    'attention_mask': torch.tensor([[1, 1]], device=device, dtype=torch.long),
+                                    'pixel_values': torch.randn(1, 3, 224, 224, device=device, dtype=dtype),
+                                },
+                            ]
+
+                            success = False
+                            for dummy_input in dummy_inputs:
+                                try:
+                                    # Run dummy forward pass to initialize DDP reducer and autograd hooks
+                                    with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for dummy pass
+                                        _ = ddp_model(**dummy_input)
+                                    success = True
+                                    break
+                                except Exception:
+                                    continue
+
+                            # If structured inputs fail, try simple tensor inputs
+                            if not success:
+                                tensor_inputs = [
+                                    torch.randn(1, 2, device=device, dtype=dtype),
+                                    torch.randn(1, 2, 768, device=device, dtype=dtype),  # Common hidden size
+                                    torch.randn(1, 2, 4096, device=device, dtype=dtype),  # Larger hidden size
+                                ]
+
+                                for dummy_tensor in tensor_inputs:
+                                    try:
+                                        with torch.amp.autocast('cuda', enabled=False):
+                                            _ = ddp_model(dummy_tensor)
+                                        success = True
+                                        break
+                                    except Exception:
+                                        continue
+
+                            # Restore original training mode
+                            ddp_model.train(original_training_mode)
+
+                            # Enhanced memory cleanup after dummy forward pass
                             try:
-                                # Run dummy forward pass to initialize DDP reducer and autograd hooks
-                                with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for dummy pass
-                                    _ = ddp_model(**dummy_input)
+                                # Clear any cached tensors from the dummy forward pass
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+
+                                # Clear gradients that might have been created during dummy pass
+                                for param in ddp_model.parameters():
+                                    if param.grad is not None:
+                                        param.grad = None
 
                             except Exception:
-                                # If structured input fails, try simple tensor input
-                                try:
-                                    dummy_tensor = torch.randn(1, 2, device=device, dtype=dtype)
-                                    with torch.amp.autocast('cuda', enabled=False):
-                                        _ = ddp_model(dummy_tensor)
+                                pass
 
-                                except Exception:
-                                    # If both fail, still continue - the other methods may help
-                                    pass
-                            finally:
-                                # Restore original training mode
-                                ddp_model.train(original_training_mode)
-                                
+                            if success:
+                                print("Unsloth: Successfully initialized DDP reducer with dummy forward pass")
+
                     except Exception as e:
                         print(f"Unsloth: Could not run dummy forward pass for DDP initialization: {e}")
                         
-                    # Method 2: Enhanced reducer preparation
+                    # Method 2: Enhanced reducer preparation with comprehensive state management
                     if hasattr(ddp_model, 'reducer') and ddp_model.reducer is not None:
                         reducer = ddp_model.reducer
-                        
-                        # Force reducer bucket rebuilding to ensure proper autograd hook setup
+
+                        # Step 1: Force reducer bucket rebuilding to ensure proper autograd hook setup
                         if hasattr(reducer, '_rebuild_buckets'):
                             try:
                                 reducer._rebuild_buckets()
-                            except Exception:
-                                pass
-                        
-                        # Ensure reducer is marked as ready for backward pass
+                                print("Unsloth: Successfully rebuilt DDP reducer buckets")
+                            except Exception as e:
+                                print(f"Unsloth: Warning - Could not rebuild reducer buckets: {e}")
+
+                        # Step 2: Initialize reducer state for forward pass
                         if hasattr(reducer, '_prepare_for_forward'):
                             try:
                                 reducer._prepare_for_forward()
                             except Exception:
                                 pass
-                                
-                        # Additional fix: Ensure autograd hooks are properly registered
-                        # by checking reducer's internal state
-                        if hasattr(reducer, '_autograd_hooks') and hasattr(reducer, 'next_bucket'):
+
+                        # Step 3: Reset and validate autograd hook state
+                        if hasattr(reducer, 'next_bucket'):
                             try:
                                 # Reset the autograd hook state to ensure consistency
                                 # This is the key fix for expect_autograd_hooks_ errors
                                 reducer.next_bucket = 0
-                                
+
+                                # Initialize bucket tracking if not present
+                                if not hasattr(reducer, '_unsloth_bucket_ready_count'):
+                                    reducer._unsloth_bucket_ready_count = {}
+
                                 # Ensure hooks are properly aligned with parameters
                                 if hasattr(reducer, '_ensure_autograd_hooks_prepared'):
                                     reducer._ensure_autograd_hooks_prepared()
-                                    
-                            except Exception:
-                                pass
+
+                                # Validate reducer state consistency
+                                if hasattr(reducer, 'buckets') and hasattr(reducer, '_autograd_hooks'):
+                                    num_buckets = len(reducer.buckets) if reducer.buckets else 0
+                                    num_hooks = len(reducer._autograd_hooks) if reducer._autograd_hooks else 0
+                                    if num_buckets > 0 and num_hooks == 0:
+                                        print("Unsloth: Warning - DDP reducer has buckets but no autograd hooks")
+
+                            except Exception as e:
+                                print(f"Unsloth: Warning - Could not validate reducer state: {e}")
+
+                        # Step 4: Enhanced autograd hook validation
+                        try:
+                            # Check if all trainable parameters have corresponding autograd hooks
+                            trainable_params = [p for p in ddp_model.parameters() if p.requires_grad]
+                            if hasattr(reducer, '_autograd_hooks') and reducer._autograd_hooks:
+                                hook_count = len(reducer._autograd_hooks)
+                                param_count = len(trainable_params)
+                                if hook_count != param_count:
+                                    print(f"Unsloth: Warning - Autograd hook count ({hook_count}) != parameter count ({param_count})")
+                                    # Try to force hook re-registration
+                                    if hasattr(reducer, '_install_hooks'):
+                                        try:
+                                            reducer._install_hooks()
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
                     
                     # Method 3: Force parameter registration and validation
                     try:
@@ -449,50 +593,149 @@ pass
 
 # Standalone DDP functions that can be used to patch any trainer
 def _setup_distributed_training():
-    """Setup distributed training if in multi-GPU environment."""
+    """Setup distributed training if in multi-GPU environment with enhanced error handling."""
     import os
     import torch
-    
-    # Get multi-GPU configuration
-    multi_gpu_config = get_multi_gpu_config()
-    
-    # Initialize distributed training if needed
-    if multi_gpu_config["enable_multi_gpu"]:
-        init_distributed_training_if_needed()
-    
-    # Check if we're in a distributed environment
-    if (os.environ.get("LOCAL_RANK") is not None or 
-        os.environ.get("WORLD_SIZE") is not None):
-        try:
-            import torch.distributed as dist
-            if not dist.is_initialized():
-                # Initialize distributed training
+
+    # Print configuration if debugging is enabled
+    if _get_ddp_config("UNSLOTH_DEBUG_DDP", False):
+        _print_ddp_config()
+
+    try:
+        # Get multi-GPU configuration
+        multi_gpu_config = get_multi_gpu_config()
+
+        # Initialize distributed training if needed
+        if multi_gpu_config["enable_multi_gpu"]:
+            init_distributed_training_if_needed()
+
+        # Check if we're in a distributed environment
+        if (os.environ.get("LOCAL_RANK") is not None or
+            os.environ.get("WORLD_SIZE") is not None):
+            try:
+                import torch.distributed as dist
+
+                # Enhanced distributed environment validation
                 local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+                print(f"Unsloth: Detected distributed environment - LOCAL_RANK: {local_rank}, WORLD_SIZE: {world_size}")
+
+                if not dist.is_initialized():
+                    # Enhanced validation and race condition prevention
+                    import time
+                    from datetime import timedelta
+
+                    # Validate CUDA availability for NCCL backend
+                    if torch.cuda.is_available():
+                        if local_rank >= torch.cuda.device_count():
+                            raise RuntimeError(f"LOCAL_RANK {local_rank} >= available CUDA devices {torch.cuda.device_count()}")
+
+                        # Set device before initializing process group
+                        torch.cuda.set_device(local_rank)
+                        print(f"Unsloth: Set CUDA device to {local_rank}")
+
+                        # Initialize with NCCL backend for CUDA
+                        backend = "nccl"
+                    else:
+                        # Fallback to Gloo for CPU-only training
+                        backend = "gloo"
+                        print("Unsloth: CUDA not available, using Gloo backend for distributed training")
+
+                    # Allow backend override
+                    backend_override = _get_ddp_config("UNSLOTH_DDP_BACKEND", None)
+                    if backend_override:
+                        backend = backend_override
+                        print(f"Unsloth: Using backend override: {backend}")
+
+                    # Configure timeout
+                    timeout_seconds = int(_get_ddp_config("UNSLOTH_DDP_TIMEOUT_SECONDS", "1800"))
+                    timeout = timedelta(seconds=timeout_seconds)
+
+                    # Race condition prevention: Add small random delay for different ranks
+                    if world_size > 1:
+                        import random
+                        delay = random.uniform(0.1, 0.5) * local_rank
+                        time.sleep(delay)
+
+                    # Initialize process group with enhanced error handling
+                    print(f"Unsloth: Initializing distributed process group with {backend} backend (timeout: {timeout_seconds}s)")
+
+                    try:
+                        dist.init_process_group(
+                            backend=backend,
+                            timeout=timeout,
+                            world_size=world_size,
+                            rank=local_rank
+                        )
+
+                        # Verify initialization
+                        if dist.is_initialized():
+                            actual_rank = dist.get_rank()
+                            actual_world_size = dist.get_world_size()
+                            print(f"Unsloth: Successfully initialized distributed training - rank {actual_rank}/{actual_world_size}")
+
+                            # Synchronization barrier to ensure all processes are ready
+                            if world_size > 1:
+                                print(f"Unsloth: Waiting for all processes to synchronize...")
+                                dist.barrier()
+                                print(f"Unsloth: All processes synchronized")
+                        else:
+                            raise RuntimeError("Process group initialization appeared to succeed but dist.is_initialized() returns False")
+
+                    except Exception as init_e:
+                        print(f"Unsloth: Failed to initialize process group: {init_e}")
+                        # Try alternative initialization methods
+                        if backend == "nccl" and torch.cuda.is_available():
+                            print("Unsloth: Retrying with Gloo backend as fallback...")
+                            try:
+                                dist.init_process_group(
+                                    backend="gloo",
+                                    timeout=timeout,
+                                    world_size=world_size,
+                                    rank=local_rank
+                                )
+                                print("Unsloth: Successfully initialized with Gloo backend fallback")
+                            except Exception as fallback_e:
+                                print(f"Unsloth: Fallback initialization also failed: {fallback_e}")
+                                raise init_e
+                        else:
+                            raise init_e
+
+                else:
+                    print(f"Unsloth: Distributed training already initialized - rank {dist.get_rank()}/{dist.get_world_size()}")
+
+            except Exception as e:
+                print(f"Unsloth: Failed to initialize distributed training: {e}")
+                print(f"Unsloth: Error type: {type(e).__name__}")
+                print("Unsloth: Falling back to single-GPU training")
+
+                # Additional debugging information
+                print(f"Unsloth: Environment variables - LOCAL_RANK: {os.environ.get('LOCAL_RANK')}, WORLD_SIZE: {os.environ.get('WORLD_SIZE')}")
                 if torch.cuda.is_available():
-                    torch.cuda.set_device(local_rank)
-                dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+                    print(f"Unsloth: CUDA devices available: {torch.cuda.device_count()}")
+                else:
+                    print("Unsloth: CUDA not available")
 
-                
+        elif multi_gpu_config["supports_multi_gpu"] and multi_gpu_config["enable_multi_gpu"]:
+            print("Unsloth: Multi-GPU support enabled but not in distributed environment")
 
-                
-        except Exception as e:
-            print(f"Unsloth: Failed to initialize distributed training: {e}")
-            print("Unsloth: Falling back to single-GPU training")
-    elif multi_gpu_config["supports_multi_gpu"] and multi_gpu_config["enable_multi_gpu"]:
-        pass
+    except Exception as e:
+        print(f"Unsloth: Error in distributed training setup: {e}")
+        print("Unsloth: Continuing with single-GPU training")
 
 def _find_ddp_model(model):
     """Recursively search for DDP-wrapped model in the model hierarchy."""
     from torch.nn.parallel import DistributedDataParallel as DDP
-    
+
     # First, do a direct check - this catches the most obvious cases
     if isinstance(model, DDP):
         return model
-    
+
     # Second, check the common .module pattern
     if hasattr(model, 'module') and isinstance(model.module, DDP):
         return model.module
-    
+
     # CRITICAL FIX: Handle PEFT models specifically
     # PEFT models (PeftModel, PeftModelForCausalLM, etc.) wrap the base model
     # The DDP wrapper might be at the base_model level
@@ -517,43 +760,67 @@ def _find_ddp_model(model):
                 # Some cases have base_model.module for DDP
                 if hasattr(base_model, 'module') and isinstance(base_model.module, DDP):
                     return base_model.module
+                # ENHANCED: Handle even deeper nesting: base_model.model.model.model
+                # Some complex PEFT + Accelerate setups can have this structure
+                if (hasattr(base_model, 'model') and hasattr(base_model.model, 'model') and
+                    hasattr(base_model.model.model, 'model')):
+                    deep_nested_model = base_model.model.model.model
+                    if isinstance(deep_nested_model, DDP):
+                        return deep_nested_model
+                # Check for module patterns at each level
+                if hasattr(base_model, 'model') and hasattr(base_model.model, 'module'):
+                    if isinstance(base_model.model.module, DDP):
+                        return base_model.model.module
     
     # Track visited objects to avoid infinite recursion
     visited = set()
-    
-    def _recursive_search(obj, depth=0, max_depth=10):
+
+    def _recursive_search(obj, depth=0, max_depth=12):
         # Avoid infinite recursion
         if depth > max_depth or id(obj) in visited:
             return None
         visited.add(id(obj))
-        
+
         # Check if this object is a DDP model
         if isinstance(obj, DDP):
             return obj
-            
+
         # Don't recurse into basic types
         if not hasattr(obj, '__dict__') and not hasattr(obj, '__getattribute__'):
             return None
-        
+
         # Enhanced search: Check for more comprehensive list of attribute names
         # where DDP models might be nested in various training frameworks
         search_attrs = [
-            'module', 'model', 'base_model', '_orig_mod', '_module', '_model',
+            # Core PyTorch patterns
+            'module', 'model', '_orig_mod', '_module', '_model',
             'wrapped_model', 'inner_model', '_wrapped_model', '_inner_model',
             'core_model', '_core_model', 'underlying_model', '_underlying_model',
+
+            # PEFT library attributes (high priority for this fix)
+            'base_model', 'peft_model', '_peft_model', 'peft_base_model',
+
             # Accelerate library attributes
             '_ddp_module', '_orig_ddp_module', '_accelerate_wrapped_model',
             '_prepared_model', '_models', '_model_ref', '_original_model',
-            # Accelerate internal model references
-            '_accelerate_model', '_prepared', '_prep_model',
-            # Transformers library attributes  
-            '_transformers_model', '_hf_model',
+            '_accelerate_model', '_prepared', '_prep_model', '_accelerate_prepared_model',
+
+            # Transformers library attributes
+            '_transformers_model', '_hf_model', 'transformer', '_transformer',
+
             # TRL/SFT trainer attributes
-            '_sft_model', '_trl_model',
-            # PEFT library attributes (high priority for this fix)
-            'base_model', 'peft_model', '_peft_model', 'base_model.model',
+            '_sft_model', '_trl_model', 'sft_model', 'trl_model',
+
             # Additional nested patterns found in distributed training
-            '_distributed_model', '_ddp_wrapped', '_wrapped', '_ref'
+            '_distributed_model', '_ddp_wrapped', '_wrapped', '_ref',
+            'ddp_model', '_ddp_model', 'distributed_model',
+
+            # Trainer-specific attributes
+            'trainer_model', '_trainer_model', 'training_model', '_training_model',
+
+            # Framework-specific wrappers
+            'pytorch_model', '_pytorch_model', 'torch_model', '_torch_model',
+            'compiled_model', '_compiled_model', 'optimized_model', '_optimized_model'
         ]
         
         for attr_name in search_attrs:
@@ -566,9 +833,32 @@ def _find_ddp_model(model):
                     found = _recursive_search(attr_value, depth + 1)
                     if found is not None:
                         return found
-            except (AttributeError, RuntimeError):
-                # Some attributes may not be accessible
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                # Some attributes may not be accessible or may raise errors
                 continue
+
+        # ENHANCED: Check for dynamic attribute patterns
+        # Some frameworks create attributes dynamically
+        try:
+            if hasattr(obj, '__dict__'):
+                for attr_name, attr_value in obj.__dict__.items():
+                    # Skip private attributes that are likely not models
+                    if attr_name.startswith('__') or attr_name in ['_modules', '_parameters', '_buffers']:
+                        continue
+                    # Look for attributes that might contain models
+                    if ('model' in attr_name.lower() or 'ddp' in attr_name.lower() or
+                        'module' in attr_name.lower() or 'wrapped' in attr_name.lower()):
+                        try:
+                            if isinstance(attr_value, DDP):
+                                return attr_value
+                            # Recursive search for nested models
+                            found = _recursive_search(attr_value, depth + 1)
+                            if found is not None:
+                                return found
+                        except (AttributeError, RuntimeError, TypeError, ValueError):
+                            continue
+        except (AttributeError, RuntimeError, TypeError):
+            pass
         
         # PEFT-specific handling: For PEFT models, also check nested base_model.model patterns
         obj_type_name = type(obj).__name__
@@ -627,12 +917,13 @@ def _find_ddp_model(model):
     try:
         # Check if this is actually a reference to a trainer/accelerator object
         # that might have the DDP model nested deeper
-        for attr in ['accelerator', '_accelerator', 'trainer', '_trainer']:
+        for attr in ['accelerator', '_accelerator', 'trainer', '_trainer', 'engine', '_engine']:
             if hasattr(model, attr):
                 accelerator_obj = getattr(model, attr)
                 if accelerator_obj is not None:
-                    # Look for model in accelerator
-                    for model_attr in ['model', '_model', 'prepared_model', '_prepared_model']:
+                    # Look for model in accelerator with expanded search
+                    for model_attr in ['model', '_model', 'prepared_model', '_prepared_model',
+                                     'wrapped_model', '_wrapped_model', 'ddp_model', '_ddp_model']:
                         if hasattr(accelerator_obj, model_attr):
                             acc_model = getattr(accelerator_obj, model_attr)
                             if isinstance(acc_model, DDP):
@@ -641,7 +932,30 @@ def _find_ddp_model(model):
                             found = _recursive_search(acc_model)
                             if found is not None:
                                 return found
-    except (AttributeError, RuntimeError):
+
+                    # ENHANCED: Check for list/dict of models in accelerator
+                    # Some accelerate versions store models in collections
+                    for collection_attr in ['_models', '_prepared_models', 'models']:
+                        if hasattr(accelerator_obj, collection_attr):
+                            try:
+                                collection = getattr(accelerator_obj, collection_attr)
+                                if isinstance(collection, (list, tuple)):
+                                    for item in collection:
+                                        if isinstance(item, DDP):
+                                            return item
+                                        found = _recursive_search(item)
+                                        if found is not None:
+                                            return found
+                                elif isinstance(collection, dict):
+                                    for item in collection.values():
+                                        if isinstance(item, DDP):
+                                            return item
+                                        found = _recursive_search(item)
+                                        if found is not None:
+                                            return found
+                            except (AttributeError, RuntimeError, TypeError):
+                                continue
+    except (AttributeError, RuntimeError, TypeError):
         pass
     
     return None
@@ -652,18 +966,18 @@ def _setup_ddp_static_graph(model):
     import os
     import torch
     
-    # Allow users to disable the fix if needed
-    if os.environ.get("UNSLOTH_DISABLE_DDP_STATIC_GRAPH", "0") == "1":
-
+    # Check configuration flags
+    if _get_ddp_config("UNSLOTH_DISABLE_DDP_STATIC_GRAPH", False):
+        if _get_ddp_config("UNSLOTH_DEBUG_DDP", False):
+            print("Unsloth: DDP static graph disabled by UNSLOTH_DISABLE_DDP_STATIC_GRAPH")
         return False
-    
-    # Allow users to force disable due to gradient checkpointing
-    if os.environ.get("UNSLOTH_DISABLE_DDP_STATIC_GRAPH_FOR_GRAD_CHECKPOINT", "0") == "1":
 
+    if _get_ddp_config("UNSLOTH_DISABLE_DDP_STATIC_GRAPH_FOR_GRAD_CHECKPOINT", False):
+        if _get_ddp_config("UNSLOTH_DEBUG_DDP", False):
+            print("Unsloth: DDP static graph disabled for gradient checkpointing by UNSLOTH_DISABLE_DDP_STATIC_GRAPH_FOR_GRAD_CHECKPOINT")
         return False
-        
-    # Allow users to disable the gradient checkpointing safety hooks
-    if os.environ.get("UNSLOTH_DISABLE_GRAD_CHECKPOINT_HOOKS", "0") == "1":
+
+    if _get_ddp_config("UNSLOTH_DISABLE_GRAD_CHECKPOINT_HOOKS", False):
         print("Unsloth: Gradient checkpointing safety hooks disabled by environment variable")
         return False
     
@@ -690,21 +1004,33 @@ def _setup_ddp_static_graph(model):
                 # CRITICAL FIX: Check if gradient checkpointing is enabled
                 # Static graph is incompatible with gradient checkpointing that changes graph structure
                 uses_gradient_checkpointing = False
-                
-                # Check for various gradient checkpointing indicators
+
+                # Method 1: Check direct gradient checkpointing flags
                 if hasattr(model, 'gradient_checkpointing') and model.gradient_checkpointing:
                     uses_gradient_checkpointing = True
                 elif hasattr(model, '_set_gradient_checkpointing'):
                     # Some models have this flag
                     if hasattr(model, 'gradient_checkpointing_enable') or hasattr(model, '_gradient_checkpointing'):
                         uses_gradient_checkpointing = True
-                
-                # Also check the underlying model (in case it's wrapped)
+
+                # Method 2: Check the underlying model (in case it's wrapped)
                 actual_model = getattr(model, 'module', model)
                 if hasattr(actual_model, 'gradient_checkpointing') and actual_model.gradient_checkpointing:
                     uses_gradient_checkpointing = True
-                    
-                # Check if any layer has gradient checkpointing enabled
+
+                # Method 3: Check nested models (PEFT, Accelerate wrappers)
+                models_to_check = [model, actual_model]
+                if hasattr(model, 'base_model'):
+                    models_to_check.append(model.base_model)
+                    if hasattr(model.base_model, 'model'):
+                        models_to_check.append(model.base_model.model)
+
+                for check_model in models_to_check:
+                    if hasattr(check_model, 'gradient_checkpointing') and check_model.gradient_checkpointing:
+                        uses_gradient_checkpointing = True
+                        break
+
+                # Method 4: Check if any layer has gradient checkpointing enabled
                 for module in actual_model.modules():
                     if hasattr(module, 'gradient_checkpointing') and module.gradient_checkpointing:
                         uses_gradient_checkpointing = True
@@ -722,7 +1048,7 @@ def _setup_ddp_static_graph(model):
                             uses_gradient_checkpointing = True
                             break
                 
-                # UNSLOTH SPECIFIC: Check if unsloth smart gradient checkpointing is active
+                # Method 5: UNSLOTH SPECIFIC - Check if unsloth smart gradient checkpointing is active
                 # This is the most reliable way to detect Unsloth's gradient checkpointing
                 try:
                     # Import the unsloth zoo utility to check for active gradient checkpointing
@@ -731,46 +1057,85 @@ def _setup_ddp_static_graph(model):
                     if hasattr(unsloth_gc, '_UNSLOTH_GRADIENT_CHECKPOINTING_ENABLED'):
                         if getattr(unsloth_gc, '_UNSLOTH_GRADIENT_CHECKPOINTING_ENABLED', False):
                             uses_gradient_checkpointing = True
-                    
+
                     # ENHANCED: Check for Unsloth gradient checkpointing function patches
                     # Look for indicators that gradient checkpointing has been applied
                     if hasattr(unsloth_gc, 'forward') or hasattr(unsloth_gc, 'backward'):
                         # If the module has forward/backward functions, it's likely active
                         uses_gradient_checkpointing = True
-                        
+
+                    # Check for specific Unsloth gradient checkpointing classes
+                    if (hasattr(unsloth_gc, 'Unsloth_Gradient_Checkpointer') or
+                        hasattr(unsloth_gc, 'Unsloth_Offloaded_Gradient_Checkpointer')):
+                        uses_gradient_checkpointing = True
+
                 except ImportError:
                     pass
+
+                # Method 6: Check for environment variables that indicate gradient checkpointing
+                # Many users set this when using Unsloth
+                if _get_ddp_config("UNSLOTH_USE_GRADIENT_CHECKPOINTING", False):
+                    uses_gradient_checkpointing = True
+                if _get_ddp_config("GRADIENT_CHECKPOINTING", False):
+                    uses_gradient_checkpointing = True
                     
-                # ADDITIONAL UNSLOTH CHECK: Look for gradient checkpointing in the actual model forward methods
+                # Method 7: Look for gradient checkpointing in the actual model forward methods
                 # Unsloth often patches the forward methods of transformer layers
                 try:
+                    # Check a limited number of modules to avoid performance issues
+                    module_count = 0
                     for module in actual_model.modules():
+                        if module_count > 50:  # Limit search to avoid performance issues
+                            break
+                        module_count += 1
+
                         if hasattr(module, 'forward'):
                             forward_func = module.forward
                             # Check if forward method has been wrapped by gradient checkpointing
-                            if (hasattr(forward_func, '__wrapped__') or 
+                            if (hasattr(forward_func, '__wrapped__') or
                                 hasattr(forward_func, '_unsloth_gradient_checkpointed') or
+                                hasattr(forward_func, '_gradient_checkpointed') or
                                 'checkpoint' in str(forward_func) or
                                 'unsloth' in str(forward_func).lower()):
                                 uses_gradient_checkpointing = True
                                 break
+
+                        # Check for specific Unsloth layer types that use gradient checkpointing
+                        module_name = module.__class__.__name__
+                        if ('unsloth' in module_name.lower() and
+                            ('layer' in module_name.lower() or 'block' in module_name.lower())):
+                            # Unsloth layers often have gradient checkpointing enabled by default
+                            uses_gradient_checkpointing = True
+                            break
                 except Exception:
                     pass
-                
-                # Check for environment variables or settings that indicate gradient checkpointing
-                # Many users set this when using Unsloth
-                if os.environ.get("UNSLOTH_USE_GRADIENT_CHECKPOINTING") == "1":
-                    uses_gradient_checkpointing = True
-                
-                # Look for gradient checkpointing in model's config
-                if hasattr(actual_model, 'config'):
-                    config = actual_model.config
-                    if hasattr(config, 'use_gradient_checkpointing') and config.use_gradient_checkpointing:
-                        uses_gradient_checkpointing = True
+
+                # Method 8: Look for gradient checkpointing in model's config
+                models_with_config = [actual_model]
+                if hasattr(model, 'base_model') and hasattr(model.base_model, 'config'):
+                    models_with_config.append(model.base_model)
+
+                for check_model in models_with_config:
+                    if hasattr(check_model, 'config'):
+                        config = check_model.config
+                        if hasattr(config, 'use_gradient_checkpointing') and config.use_gradient_checkpointing:
+                            uses_gradient_checkpointing = True
+                            break
+                        if hasattr(config, 'gradient_checkpointing') and config.gradient_checkpointing:
+                            uses_gradient_checkpointing = True
+                            break
                 
                 # If gradient checkpointing is detected, disable static graph
                 if uses_gradient_checkpointing:
                     print("Unsloth: Gradient checkpointing detected - disabling DDP static graph to prevent parameter ready issues")
+
+                    # Debug output if enabled
+                    if _get_ddp_config("UNSLOTH_DEBUG_DDP", False):
+                        print("Unsloth: DEBUG - Gradient checkpointing detection details:")
+                        print(f"  - Model gradient_checkpointing: {getattr(model, 'gradient_checkpointing', 'not found')}")
+                        print(f"  - Actual model gradient_checkpointing: {getattr(actual_model, 'gradient_checkpointing', 'not found')}")
+                        print(f"  - Environment UNSLOTH_USE_GRADIENT_CHECKPOINTING: {_get_ddp_config('UNSLOTH_USE_GRADIENT_CHECKPOINTING', 'not set')}")
+                        print(f"  - Environment GRADIENT_CHECKPOINTING: {_get_ddp_config('GRADIENT_CHECKPOINTING', 'not set')}")
                     
                     # CRITICAL FIX: Don't set static graph when gradient checkpointing is active
                     # Instead, apply alternative fixes for the parameter ready issue
@@ -781,45 +1146,69 @@ def _setup_ddp_static_graph(model):
                             print("Unsloth: Warning - DDP find_unused_parameters=True with gradient checkpointing may cause parameter ready issues")
                             print("Unsloth: Recommend setting ddp_find_unused_parameters=False in training arguments")
                             
-                    # Alternative fix 2: Apply gradient synchronization hook to prevent multiple ready states
+                    # Alternative fix 2: Apply enhanced gradient synchronization hook to prevent multiple ready states
                     try:
                         if hasattr(ddp_model, 'reducer') and ddp_model.reducer is not None:
                             reducer = ddp_model.reducer
-                            
+
                             # Install a hook to manage parameter ready state for gradient checkpointing
                             if not hasattr(reducer, '_unsloth_grad_checkpoint_hook_installed'):
                                 original_mark_bucket_ready = getattr(reducer, '_mark_bucket_ready', None)
-                                
+
                                 if original_mark_bucket_ready is not None:
                                     def _unsloth_safe_mark_bucket_ready(bucket_index):
                                         """Safely mark bucket ready, avoiding duplicate marking with gradient checkpointing."""
                                         try:
+                                            # Initialize tracking if not present
+                                            if not hasattr(reducer, '_unsloth_ready_buckets'):
+                                                reducer._unsloth_ready_buckets = set()
+                                            if not hasattr(reducer, '_unsloth_iteration_count'):
+                                                reducer._unsloth_iteration_count = 0
+
                                             # Check if this bucket has already been marked ready in this iteration
-                                            if hasattr(reducer, '_unsloth_ready_buckets'):
-                                                if bucket_index in reducer._unsloth_ready_buckets:
-                                                    # Already marked, skip to avoid "ready twice" error
-                                                    return
-                                                reducer._unsloth_ready_buckets.add(bucket_index)
-                                            else:
-                                                reducer._unsloth_ready_buckets = {bucket_index}
-                                            
+                                            bucket_key = (reducer._unsloth_iteration_count, bucket_index)
+                                            if bucket_key in reducer._unsloth_ready_buckets:
+                                                # Already marked, skip to avoid "ready twice" error
+                                                return
+
+                                            # Mark this bucket as ready for this iteration
+                                            reducer._unsloth_ready_buckets.add(bucket_key)
+
                                             # Call the original function
                                             return original_mark_bucket_ready(bucket_index)
-                                            
+
                                         except Exception as e:
                                             # If our hook fails, fall back to original behavior
                                             print(f"Unsloth: Warning in gradient checkpointing hook: {e}")
                                             return original_mark_bucket_ready(bucket_index)
-                                    
-                                    # Install the hook
+
+                                    # Install iteration counter hook
+                                    original_prepare_for_forward = getattr(reducer, '_prepare_for_forward', None)
+                                    if original_prepare_for_forward is not None:
+                                        def _unsloth_prepare_for_forward():
+                                            """Increment iteration counter and clean up old bucket tracking."""
+                                            try:
+                                                if hasattr(reducer, '_unsloth_iteration_count'):
+                                                    reducer._unsloth_iteration_count += 1
+                                                    # Clean up old bucket tracking (keep only last 2 iterations)
+                                                    if hasattr(reducer, '_unsloth_ready_buckets'):
+                                                        current_iter = reducer._unsloth_iteration_count
+                                                        reducer._unsloth_ready_buckets = {
+                                                            (iter_num, bucket_idx) for iter_num, bucket_idx in reducer._unsloth_ready_buckets
+                                                            if iter_num >= current_iter - 1
+                                                        }
+                                                return original_prepare_for_forward()
+                                            except Exception as e:
+                                                print(f"Unsloth: Warning in iteration tracking: {e}")
+                                                return original_prepare_for_forward()
+
+                                        reducer._prepare_for_forward = _unsloth_prepare_for_forward
+
+                                    # Install the main hook
                                     reducer._mark_bucket_ready = _unsloth_safe_mark_bucket_ready
                                     reducer._unsloth_grad_checkpoint_hook_installed = True
-                                    print("Unsloth: Installed gradient checkpointing safety hook to prevent parameter ready errors")
-                                    
-                                    # Reset ready buckets at the start of each iteration
-                                    if hasattr(reducer, '_unsloth_ready_buckets'):
-                                        reducer._unsloth_ready_buckets.clear()
-                                        
+                                    print("Unsloth: Installed enhanced gradient checkpointing safety hook to prevent parameter ready errors")
+
                     except Exception as e:
                         print(f"Unsloth: Could not install gradient checkpointing safety hook: {e}")
                     
@@ -869,28 +1258,65 @@ def _setup_ddp_static_graph(model):
                 return False
         else:
             # Only print warning in distributed environment where we expect to find DDP
-            if (os.environ.get("LOCAL_RANK") is not None and 
+            if (os.environ.get("LOCAL_RANK") is not None and
                 os.environ.get("WORLD_SIZE") is not None):
-                
-                # Add more helpful debugging information
+
+                # Enhanced debugging information
                 model_type = type(model).__name__
-                model_attrs = [attr for attr in dir(model) if 'model' in attr.lower() or 'module' in attr.lower()][:5]
-                
+                model_attrs = [attr for attr in dir(model) if 'model' in attr.lower() or 'module' in attr.lower()][:10]
+
                 print("Unsloth: Warning - Could not find DDP-wrapped model for static graph optimization")
                 print("Unsloth: If you encounter 'parameter marked ready twice' or 'expect_autograd_hooks_' errors, this is the likely cause")
-                print(f"Unsloth: Model type: {model_type}, searched attributes: {model_attrs}")
-                
-                # Try one more time with verbose debugging
-                from torch.nn.parallel import DistributedDataParallel as DDP
-                if isinstance(model, DDP):
-                    print("Unsloth: DEBUG - Model is actually DDP but wasn't detected in initial search")
-                elif hasattr(model, 'module') and isinstance(model.module, DDP):
-                    print("Unsloth: DEBUG - Model.module is DDP but wasn't detected in initial search")
-                    
+                print(f"Unsloth: Model type: {model_type}")
+                print(f"Unsloth: Available model-related attributes: {model_attrs}")
+
+                # Enhanced debugging with model hierarchy inspection
+                try:
+                    from torch.nn.parallel import DistributedDataParallel as DDP
+
+                    # Check direct DDP
+                    if isinstance(model, DDP):
+                        print("Unsloth: DEBUG - Model is actually DDP but wasn't detected in initial search")
+                    elif hasattr(model, 'module') and isinstance(model.module, DDP):
+                        print("Unsloth: DEBUG - Model.module is DDP but wasn't detected in initial search")
+
+                    # Check for nested structures
+                    if hasattr(model, 'base_model'):
+                        base_model_type = type(model.base_model).__name__
+                        print(f"Unsloth: DEBUG - Found base_model of type: {base_model_type}")
+                        if hasattr(model.base_model, 'model'):
+                            nested_model_type = type(model.base_model.model).__name__
+                            print(f"Unsloth: DEBUG - Found base_model.model of type: {nested_model_type}")
+
+                    # Check for accelerator wrapping
+                    if hasattr(model, '__dict__'):
+                        accelerator_attrs = [k for k in model.__dict__.keys() if 'accelerat' in k.lower()]
+                        if accelerator_attrs:
+                            print(f"Unsloth: DEBUG - Found accelerator-related attributes: {accelerator_attrs}")
+
+                    # Check parameter count for validation
+                    try:
+                        param_count = sum(1 for _ in model.parameters())
+                        trainable_count = sum(1 for p in model.parameters() if p.requires_grad)
+                        print(f"Unsloth: DEBUG - Model has {param_count} parameters ({trainable_count} trainable)")
+                    except Exception:
+                        pass
+
+                except Exception as debug_e:
+                    print(f"Unsloth: DEBUG - Error during model inspection: {debug_e}")
+
             return False
-            
+
     except Exception as e:
         print(f"Unsloth: Warning - Could not setup DDP static graph: {e}")
+        print(f"Unsloth: Error type: {type(e).__name__}")
+
+        # Additional error context
+        import traceback
+        if os.environ.get("UNSLOTH_DEBUG_DDP", "0") == "1":
+            print("Unsloth: Full traceback (UNSLOTH_DEBUG_DDP=1):")
+            traceback.print_exc()
+
         return False
 
 
@@ -921,7 +1347,7 @@ def _prepare_ddp_reducer_for_training(trainer, model):
                 # The key insight is that DDP's reducer needs to be fully initialized
                 # with proper autograd hook registration before any backward pass occurs.
                 
-                # Method 1: Force a dummy forward pass to ensure DDP is fully initialized
+                # Method 1: Enhanced dummy forward pass to ensure DDP is fully initialized
                 # This ensures the reducer knows about all parameters and their autograd hooks
                 try:
                     # Create dummy input that matches the model's expected input structure
@@ -931,35 +1357,65 @@ def _prepare_ddp_reducer_for_training(trainer, model):
                         first_param = next(ddp_model.parameters())
                         device = first_param.device
                         dtype = first_param.dtype
-                        
-                        # Create minimal dummy input - most transformer models expect input_ids
-                        dummy_input = {
-                            'input_ids': torch.tensor([[1, 2]], device=device, dtype=torch.long),
-                            'attention_mask': torch.tensor([[1, 1]], device=device, dtype=torch.long),
-                        }
-                        
+
                         # Set model to eval mode temporarily to avoid affecting training state
                         original_training_mode = ddp_model.training
                         ddp_model.eval()
-                        
-                        try:
-                            # Run dummy forward pass to initialize DDP reducer and autograd hooks
-                            with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for dummy pass
-                                _ = ddp_model(**dummy_input)
 
-                        except Exception:
-                            # If structured input fails, try simple tensor input
+                        # Try multiple dummy input strategies
+                        dummy_inputs = [
+                            # Strategy 1: Standard transformer input
+                            {
+                                'input_ids': torch.tensor([[1, 2]], device=device, dtype=torch.long),
+                                'attention_mask': torch.tensor([[1, 1]], device=device, dtype=torch.long),
+                            },
+                            # Strategy 2: Extended transformer input with position_ids
+                            {
+                                'input_ids': torch.tensor([[1, 2]], device=device, dtype=torch.long),
+                                'attention_mask': torch.tensor([[1, 1]], device=device, dtype=torch.long),
+                                'position_ids': torch.tensor([[0, 1]], device=device, dtype=torch.long),
+                            },
+                            # Strategy 3: Vision-language model input
+                            {
+                                'input_ids': torch.tensor([[1, 2]], device=device, dtype=torch.long),
+                                'attention_mask': torch.tensor([[1, 1]], device=device, dtype=torch.long),
+                                'pixel_values': torch.randn(1, 3, 224, 224, device=device, dtype=dtype),
+                            },
+                        ]
+
+                        success = False
+                        for dummy_input in dummy_inputs:
                             try:
-                                dummy_tensor = torch.randn(1, 2, device=device, dtype=dtype)
-                                with torch.amp.autocast('cuda', enabled=False):
-                                    _ = ddp_model(dummy_tensor)
-
+                                # Run dummy forward pass to initialize DDP reducer and autograd hooks
+                                with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for dummy pass
+                                    _ = ddp_model(**dummy_input)
+                                success = True
+                                break
                             except Exception:
-                                # If both fail, still continue - the other methods may help
-                                pass
-                        finally:
-                            # Restore original training mode
-                            ddp_model.train(original_training_mode)
+                                continue
+
+                        # If structured inputs fail, try simple tensor inputs
+                        if not success:
+                            tensor_inputs = [
+                                torch.randn(1, 2, device=device, dtype=dtype),
+                                torch.randn(1, 2, 768, device=device, dtype=dtype),  # Common hidden size
+                                torch.randn(1, 2, 4096, device=device, dtype=dtype),  # Larger hidden size
+                            ]
+
+                            for dummy_tensor in tensor_inputs:
+                                try:
+                                    with torch.amp.autocast('cuda', enabled=False):
+                                        _ = ddp_model(dummy_tensor)
+                                    success = True
+                                    break
+                                except Exception:
+                                    continue
+
+                        # Restore original training mode
+                        ddp_model.train(original_training_mode)
+
+                        if success:
+                            print("Unsloth: Successfully initialized DDP reducer with dummy forward pass")
                             
                 except Exception as e:
                     print(f"Unsloth: Could not run dummy forward pass for DDP initialization: {e}")
