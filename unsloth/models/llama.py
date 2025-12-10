@@ -2658,6 +2658,17 @@ class FastLlamaModel:
             assert hasattr(model, "peft_config")
 
             peft_config = model.peft_config["default"].to_dict()
+            current_parameters = {
+                "r": r,
+                "lora_alpha": lora_alpha,
+                "lora_dropout": lora_dropout,
+                "bias": bias,
+                "layers_to_transform": layers_to_transform,
+                "layers_pattern": layers_pattern,
+                "use_rslora": use_rslora,
+                "init_lora_weights": init_lora_weights,
+                "target_parameters": target_parameters,
+            }
             check_parameters = [
                 "r",
                 "lora_alpha",
@@ -2672,9 +2683,9 @@ class FastLlamaModel:
             check_all = True
             for param in check_parameters:
                 if param in peft_config:
-                    check_all = check_all and (peft_config[param] == eval(param))
+                    check_all = check_all and (peft_config[param] == current_parameters[param])
                 else:
-                    check_all = check_all and (eval(param) is None)
+                    check_all = check_all and (current_parameters[param] is None)
 
             # Check save_modules
             old_target_modules = list(peft_config["target_modules"])
@@ -2968,6 +2979,7 @@ class FastLlamaModel:
         if not SUPPORTS_RSLORA:
             del arguments["use_rslora"]
         if not SUPPORTS_TARGET_PARAMETERS:
+            # Older PEFT versions do not expose target_parameters in LoraConfig
             del arguments["target_parameters"]
 
         _saved_temp_tokenizer = model._saved_temp_tokenizer
