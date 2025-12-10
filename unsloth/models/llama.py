@@ -2587,6 +2587,7 @@ class FastLlamaModel:
             "up_proj",
             "down_proj",
         ],
+        target_parameters = None,
         lora_alpha = 16,
         lora_dropout = 0.0,
         bias = "none",
@@ -2617,6 +2618,7 @@ class FastLlamaModel:
                 model = model,
                 r = r,
                 target_modules = target_modules,
+                target_parameters = target_parameters,
                 lora_alpha = lora_alpha,
                 lora_dropout = lora_dropout,
                 bias = bias,
@@ -2665,10 +2667,14 @@ class FastLlamaModel:
                 "layers_pattern",
                 "use_rslora",
                 "init_lora_weights",
+                "target_parameters",
             ]
             check_all = True
             for param in check_parameters:
-                check_all = check_all and (peft_config[param] == eval(param))
+                if param in peft_config:
+                    check_all = check_all and (peft_config[param] == eval(param))
+                else:
+                    check_all = check_all and (eval(param) is None)
 
             # Check save_modules
             old_target_modules = list(peft_config["target_modules"])
@@ -2763,6 +2769,7 @@ class FastLlamaModel:
         signature = str(inspect.signature(LoraConfig))
         SUPPORTS_LOFTQ = "loftq_config" in signature
         SUPPORTS_RSLORA = "use_rslora" in signature
+        SUPPORTS_TARGET_PARAMETERS = "target_parameters" in signature
 
         if lora_dropout != 0:
             logger.warning_once(
@@ -2945,6 +2952,7 @@ class FastLlamaModel:
             r = r,
             lora_alpha = lora_alpha,
             target_modules = final_modules,
+            target_parameters = target_parameters,
             lora_dropout = lora_dropout,
             bias = bias,
             task_type = TaskType.CAUSAL_LM if not is_classification else TaskType.SEQ_CLS,
@@ -2959,6 +2967,8 @@ class FastLlamaModel:
             del arguments["loftq_config"]
         if not SUPPORTS_RSLORA:
             del arguments["use_rslora"]
+        if not SUPPORTS_TARGET_PARAMETERS:
+            del arguments["target_parameters"]
 
         _saved_temp_tokenizer = model._saved_temp_tokenizer
 

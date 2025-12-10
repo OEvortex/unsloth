@@ -911,6 +911,7 @@ class FastBaseModel:
         model,
         r = 16,
         target_modules = None,
+        target_parameters = None,
         lora_alpha = 16,
         lora_dropout = 0.0,
         bias = "none",
